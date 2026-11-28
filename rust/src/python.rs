@@ -26,19 +26,55 @@ fn columns(x: &[Vec<u8>]) -> PyResult<Vec<Vec<f64>>> {
 /// x columns, y, weights (float64 bytes) and p0.
 type RawData = (Vec<Vec<u8>>, Vec<u8>, Option<Vec<u8>>, Option<Vec<f64>>);
 
-/// (model or expression, variables, x, y, w, p0) as passed from Python.
-type Job<'py> = (Bound<'py, PyAny>, Vec<String>, Vec<Vec<u8>>, Vec<u8>, Option<Vec<u8>>, Option<Vec<f64>>);
+/// (model or expression, variables, x, y, w, p0, more_starts, (lower, upper)) as passed from
+/// Python; the bounds have one value per parameter (±∞ = free).
+type Job<'py> = (
+    Bound<'py, PyAny>,
+    Vec<String>,
+    Vec<Vec<u8>>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Option<Vec<f64>>,
+    Vec<Vec<f64>>,
+    (Option<Vec<f64>>, Option<Vec<f64>>),
+);
 
 fn data((x, y, w, p0): RawData) -> PyResult<Data> {
     Ok(Data { x: columns(&x)?, y: f64s(&y)?, w: w.map(|w| f64s(&w)).transpose()?, p0, ..Default::default() })
 }
 
-/// (names, params, loss, status, message, nfev, n_nonfinite, time_ms, history_ms, history_loss)
-type PyOutcome =
-    (Vec<String>, Vec<f64>, f64, &'static str, String, usize, usize, f64, Vec<f64>, Vec<f64>, usize, Option<Vec<Vec<f64>>>);
+/// (names, params, loss, status, message, nfev, n_nonfinite, time_ms, history_ms, history_loss,
+/// steps, (trace, start_losses, start_params)); pyo3 converts tuples of at most 12
+type PyOutcome = (
+    Vec<String>,
+    Vec<f64>,
+    f64,
+    &'static str,
+    String,
+    usize,
+    usize,
+    f64,
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    (Option<Vec<Vec<f64>>>, Vec<f64>, Vec<Vec<f64>>),
+);
 
 fn out(o: Outcome) -> PyOutcome {
-    (o.names, o.params, o.loss, o.status, o.message, o.nfev, o.n_nonfinite, o.time_ms, o.history_ms, o.history_loss, o.steps, o.trace)
+    (
+        o.names,
+        o.params,
+        o.loss,
+        o.status,
+        o.message,
+        o.nfev,
+        o.n_nonfinite,
+        o.time_ms,
+        o.history_ms,
+        o.history_loss,
+        o.steps,
+        (o.trace, o.start_losses, o.start_params),
+    )
 }
 
 #[pyclass(frozen, module = "symbfitrs._core")]
@@ -67,7 +103,7 @@ impl Model {
         py.detach(move || driver::predict(&c, &x, &params)).map_err(PyValueError::new_err)
     }
 
-    #[pyo3(signature = (x, y, w, p0, budget_ms, trace=false, max_steps=None))]
+    #[pyo3(signature = (x, y, w, p0, budget_ms, trace=false, max_steps=None, more_starts=Vec::new(), lower=None, upper=None))]
     #[allow(clippy::too_many_arguments)] // the pyo3 signature mirrors `Model.fit`
     fn fit(
         &self,
@@ -79,8 +115,11 @@ impl Model {
         budget_ms: f64,
         trace: bool,
         max_steps: Option<usize>,
+        more_starts: Vec<Vec<f64>>,
+        lower: Option<Vec<f64>>,
+        upper: Option<Vec<f64>>,
     ) -> PyResult<PyOutcome> {
-        let d = Data { trace, max_steps, ..data((x, y, w, p0))? };
+        let d = Data { trace, max_steps, more_starts, lower, upper, ..data((x, y, w, p0))? };
         let c = self.0.clone();
         py.detach(move || driver::fit_one(&c, d, budget_ms)).map(out).map_err(PyValueError::new_err)
     }
@@ -92,7 +131,8 @@ fn compile(expr: &str, variables: Vec<String>, params: Option<Vec<String>>) -> P
     expr::compile(expr, &variables, params.as_deref()).map(|c| Model(Arc::new(c))).map_err(PyValueError::new_err)
 }
 
-/// Jobs are (model or expression, variables, x, y, w, p0); an expression is compiled once per
+/// Jobs are (model or expression, variables, x, y, w, p0, more_starts, (lower, upper)); an
+/// expression is compiled once per
 /// batch over `variables`. Results come in job order, each (outcome tuple, "") or (None, error).
 /// `progress(n)` is called with the number of newly finished jobs.
 #[pyfunction]
@@ -109,7 +149,7 @@ fn fit_many<'py>(
     let n = jobs.len();
     let mut compiled: HashMap<(String, Vec<String>), Result<Arc<Compiled>, String>> = HashMap::new();
     let mut batch = Vec::with_capacity(n);
-    for (src, variables, x, y, w, p0) in jobs {
+    for (src, variables, x, y, w, p0, more_starts, (lower, upper)) in jobs {
         let model = match src.extract::<PyRef<Model>>() {
             Ok(m) => Ok(m.0.clone()),
             Err(_) => {
@@ -120,7 +160,7 @@ fn fit_many<'py>(
                     .clone()
             }
         };
-        batch.push((model, Data { trace, max_steps, ..data((x, y, w, p0))? }));
+        batch.push((model, Data { trace, max_steps, more_starts, lower, upper, ..data((x, y, w, p0))? }));
     }
     let (done, cancel) = (AtomicUsize::new(0), AtomicBool::new(false));
     let mut interrupt: Option<PyErr> = None;

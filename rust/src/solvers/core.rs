@@ -10,18 +10,23 @@ use super::{Lsq, Status};
 use crate::linalg::factor;
 use crate::tracker::Stop;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Opts {
     pub ftol: f64,
     pub xtol: f64,
     pub gtol: f64,
     pub tau: f64,
     pub loss_floor: f64,
+    /// Box constraints on the variables (one entry each, ±∞ = free). Active-set: a variable on a
+    /// bound whose descent direction points outward is held fixed for that iteration, and every
+    /// trial point is clipped into the box. `None` on both = unbounded (the default behaviour).
+    pub lower: Option<Vec<f64>>,
+    pub upper: Option<Vec<f64>>,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { ftol: 1e-15, xtol: 1e-15, gtol: 1e-15, tau: 1e-3, loss_floor: 1e-32 }
+        Opts { ftol: 1e-15, xtol: 1e-15, gtol: 1e-15, tau: 1e-3, loss_floor: 1e-32, lower: None, upper: None }
     }
 }
 
@@ -34,7 +39,18 @@ pub fn solve<F: Lsq>(f: &mut F, x0: &DVector<f64>, o: &Opts) -> Status {
 
 fn run<F: Lsq>(f: &mut F, x0: &DVector<f64>, o: &Opts) -> Result<Status, Stop> {
     let (m, n) = (f.m(), f.n());
+    let bounded = o.lower.is_some() || o.upper.is_some();
+    let lo = DVector::from_vec(o.lower.clone().unwrap_or_else(|| vec![f64::NEG_INFINITY; n]));
+    let hi = DVector::from_vec(o.upper.clone().unwrap_or_else(|| vec![f64::INFINITY; n]));
+    if lo.len() != n || hi.len() != n || (0..n).any(|j| lo[j].is_nan() || hi[j].is_nan() || lo[j] > hi[j]) {
+        return Ok(Status::Failure("bounds must have one entry per parameter, with lower <= upper".into()));
+    }
     let mut x = x0.clone();
+    if bounded {
+        for j in 0..n {
+            x[j] = x[j].clamp(lo[j], hi[j]); // the start is projected into the box
+        }
+    }
     let mut r = DVector::zeros(m);
     let mut sse = f.residual(&x, &mut r)?;
     if !sse.is_finite() {
@@ -72,8 +88,14 @@ fn run<F: Lsq>(f: &mut F, x0: &DVector<f64>, o: &Opts) -> Result<Status, Stop> {
         // gradient (cosine) test on the scaled problem
         let rn = r.norm();
         let grad = js.tr_mul(&r);
-        let gmax: f64 = (0..n)
-            .map(|j| {
+        // variables held fixed this iteration: on a bound with the descent direction pointing outward
+        let free: Vec<usize> = (0..n)
+            .filter(|&j| !(bounded && ((x[j] <= lo[j] && grad[j] > 0.0) || (x[j] >= hi[j] && grad[j] < 0.0))))
+            .collect();
+        let all_free = free.len() == n;
+        let gmax: f64 = free
+            .iter()
+            .map(|&j| {
                 let cn = js.column(j).norm();
                 if cn > 0.0 { grad[j].abs() / (cn * rn) } else { 0.0_f64 }
             })
@@ -81,23 +103,57 @@ fn run<F: Lsq>(f: &mut F, x0: &DVector<f64>, o: &Opts) -> Result<Status, Stop> {
         if gmax <= o.gtol {
             return Ok(Status::Converged);
         }
-        let Some(fac) = factor(&js, &r, false) else {
+        let jf;
+        let jsr: &DMatrix<f64> = if all_free {
+            &js
+        } else {
+            jf = js.select_columns(free.iter());
+            &jf
+        };
+        let Some(fac) = factor(jsr, &r, false) else {
             return Ok(Status::Failure("factorisation failed".into()));
         };
+        let mut stepf = DVector::zeros(free.len());
         let xs_norm = x.component_mul(&d).norm();
         if lam < 0.0 {
             lam = o.tau * fac.smax * fac.smax;
         }
         let (pred, sse_t) = loop {
-            let pred = fac.step(lam, &mut step);
+            let mut pred = if all_free {
+                fac.step(lam, &mut step)
+            } else {
+                let pf = fac.step(lam, &mut stepf);
+                step.fill(0.0);
+                for (k, &j) in free.iter().enumerate() {
+                    step[j] = stepf[k];
+                }
+                pf
+            };
             if step.norm() <= o.xtol * (o.xtol + xs_norm) {
                 return Ok(Status::Converged);
             }
             delta.copy_from(&step.component_div(&d));
+            let mut modified = false;
             xt.copy_from(&(&x + &delta));
+            if bounded {
+                for &j in &free {
+                    let c = xt[j].clamp(lo[j], hi[j]);
+                    if c != xt[j] {
+                        xt[j] = c;
+                        modified = true;
+                    }
+                }
+            }
+            if modified {
+                // the step was clipped into the box: its predicted reduction is that of the step actually taken
+                delta.copy_from(&(&xt - &x));
+                step.copy_from(&delta.component_mul(&d));
+                let jd = &jac * &delta;
+                pred = -2.0 * r.dot(&jd) - jd.norm_squared();
+            }
             let sse_t = f.residual(&xt, &mut rt)?;
             if sse_t.is_finite() && sse_t < sse {
-                let rho = (sse - sse_t) / pred;
+                let rho = if modified && pred <= 0.0 { 0.0 } else { (sse - sse_t) / pred };
                 lam *= f64::max(1.0 / 3.0, 1.0 - (2.0 * rho - 1.0).powi(3));
                 nu = 2.0;
                 break (pred, sse_t);

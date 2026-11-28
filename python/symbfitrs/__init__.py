@@ -9,7 +9,7 @@ results = symbfitrs.Pool(threads=8).fit_many([(expr_or_model, x, y), ...], budge
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib.metadata import version
 
@@ -17,7 +17,7 @@ import numpy as np
 
 from . import _core
 
-__all__ = ["FitResult", "Model", "Pool", "compile"]
+__all__ = ["FitResult", "Model", "Pool", "ProfileResult", "compile"]
 __version__ = version("symbfitrs")
 
 
@@ -46,6 +46,12 @@ class FitResult:
     # the start; linear parameters that the solver eliminates are already solved exactly at it.
     steps: int = 0
     trace: np.ndarray | None = None
+    # with several starts (a 2-D `p0`), every start's final loss and parameters, in start order;
+    # `params`, `loss`, `status`, `steps`, the history and the trace are the best start's. Starts
+    # that end at clearly different losses, or at the same loss with different parameters, show
+    # that the fit has more than one optimum.
+    start_losses: np.ndarray = field(default_factory=lambda: np.array([]))
+    start_params: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
 
     @property
     def success(self) -> bool:
@@ -56,6 +62,30 @@ class FitResult:
 
     def as_dict(self) -> dict[str, float]:
         return dict(zip(self.names, self.params.tolist(), strict=True))
+
+
+@dataclass(frozen=True)
+class ProfileResult:
+    """`Model.profile` output: the best fit at every point of the grid of fixed parameters.
+
+    `loss` has one axis per fixed parameter (`fixed` order, values in `grids`); `params` adds a
+    last axis with every parameter in `names` order, the fixed ones included; `status` is each
+    point's fit status. A point whose fit could not run has NaN loss and parameters."""
+
+    fixed: tuple[str, ...]
+    grids: tuple[np.ndarray, ...]
+    loss: np.ndarray
+    params: np.ndarray
+    status: np.ndarray
+    names: tuple[str, ...]
+
+    def best(self) -> dict[str, float]:
+        """The grid point with the lowest loss, as {name: value} for every parameter. Raises
+        ValueError when no point has a finite loss."""
+        if not np.isfinite(self.loss).any():
+            raise ValueError("no grid point has a finite loss")
+        i = np.unravel_index(np.nanargmin(self.loss), self.loss.shape)
+        return dict(zip(self.names, self.params[i].tolist(), strict=True))
 
 
 def _bytes(a, n: int | None, what: str) -> bytes:
@@ -86,7 +116,45 @@ def _args(variables, x, y, weights, p0):
     m = len(yb) // 8
     xs = [_bytes(c, m, f"x[{v!r}]") for v, c in zip(variables, _columns(x, variables), strict=True)]
     w = None if weights is None else _bytes(weights, m, "weights")
-    return xs, yb, w, None if p0 is None else [float(v) for v in p0]
+    first, _ = _starts(p0)
+    return xs, yb, w, first
+
+
+def _starts(p0):
+    """p0 as (first start, further starts): a 1-D p0 is one start, a 2-D one a start per row."""
+    if p0 is None:
+        return None, []
+    a = np.asarray(p0, dtype=np.float64)
+    if a.ndim == 1:
+        return a.tolist(), []
+    if a.ndim == 2 and len(a) > 0:
+        return a[0].tolist(), a[1:].tolist()
+    raise ValueError("p0 must be 1-D (one start) or 2-D (one start per row)")
+
+
+Bounds = Mapping[str, tuple[float | None, float | None]]
+
+
+def _bounds(params: Sequence[str], bounds: Bounds | None, strict: bool = True):
+    """{name: (lo, hi)} as (lower, upper) lists in `params` order; (None, None) = no bounds.
+    With `strict`, a name that is not in `params` is an error; otherwise it is skipped."""
+    if not bounds:
+        return None, None
+    unknown = [n for n in bounds if n not in params]
+    if unknown and strict:
+        raise ValueError(f"bounds for unknown parameters {unknown}")
+    if len(unknown) == len(bounds):
+        return None, None
+    lo, hi = [], []
+    for n in params:
+        a, b = bounds.get(n, (None, None))
+        lo.append(-np.inf if a is None else float(a))
+        hi.append(np.inf if b is None else float(b))
+        if not (lo[-1] <= hi[-1] and lo[-1] < np.inf and hi[-1] > -np.inf):  # also catches NaN
+            raise ValueError(
+                f"bounds for {n!r} must have lower <= upper, lower < inf, upper > -inf"
+            )
+    return lo, hi
 
 
 def _result(raw) -> FitResult:
@@ -102,7 +170,7 @@ def _result(raw) -> FitResult:
         hist_ms,
         hist_loss,
         steps,
-        trace,
+        (trace, start_losses, start_params),
     ) = raw
     return FitResult(
         tuple(names),
@@ -117,6 +185,8 @@ def _result(raw) -> FitResult:
         np.array(hist_loss),
         steps,
         None if trace is None else np.array(trace, dtype=float).reshape(-1, len(names)),
+        np.array(start_losses, dtype=float),
+        np.array(start_params, dtype=float).reshape(-1, len(names)),
     )
 
 
@@ -124,8 +194,9 @@ class Model:
     """A compiled expression: parsed, differentiated and split into linear and nonlinear
     parameters once, then fitted any number of times."""
 
-    def __init__(self, core: _core.Model) -> None:
+    def __init__(self, core: _core.Model, expr: str | None = None) -> None:
         self._core = core
+        self._expr = expr  # kept so that `profile` can recompile with parameters fixed
 
     @property
     def params(self) -> list[str]:
@@ -157,15 +228,104 @@ class Model:
         budget_ms: float = 5.0,
         trace: bool = False,
         max_steps: int | None = None,
+        bounds: Bounds | None = None,
     ) -> FitResult:
         """Minimise Σ (w (f(x; θ) − y))² from `p0` (default: all ones) within `budget_ms`.
 
+        `p0` may be 2-D, one start per row: each start is fitted in turn, with an equal share of
+        the budget that is left when it begins, and the lowest loss is kept (`start_losses` and
+        `start_params` report every start). With many starts and a small budget the last starts
+        may get no time at all: their loss is NaN.
+
+        `bounds={name: (lo, hi)}` (None = unbounded on that side) keeps every iterate inside the
+        box: a parameter on a bound is held there while its gradient points out of the box, and
+        every start is first moved into the box. Use it instead of clipping inside the
+        expression, where the clipped region has zero gradient and a parameter that lands there
+        cannot come back. `lo == hi` fixes a parameter. Bounding a linear parameter turns
+        variable projection off.
+
         `trace=True` also returns θ at step 0 (the start) and after every accepted update;
-        `max_steps` stops after that many accepted updates (status "max_steps")."""
+        `max_steps` stops after that many accepted updates (status "max_steps"). With several
+        starts, the status, steps and trace are the best start's."""
+        _, more = _starts(p0)
+        lower, upper = _bounds(self.params, bounds)
         raw = self._core.fit(
-            *_args(self.variables, x, y, weights, p0), float(budget_ms), trace, max_steps
+            *_args(self.variables, x, y, weights, p0),
+            float(budget_ms),
+            trace,
+            max_steps,
+            more,
+            lower,
+            upper,
         )
         return _result(raw)
+
+    def profile(
+        self,
+        x,
+        y,
+        fix: Mapping[str, Sequence[float]],
+        *,
+        p0=None,
+        weights=None,
+        budget_ms: float = 5.0,
+        threads: int | None = None,
+        **fit_kwargs,
+    ) -> ProfileResult:
+        """Fit with the parameters named in `fix` held at every point of their grid.
+
+        `fix` maps each fixed parameter to its grid values; the grid is their outer product, in
+        the order given. Every point is fitted from `p0` (in `params` order; the fixed entries
+        are ignored) within `budget_ms`, on a `Pool` of `threads`. Further keyword arguments go
+        to `Pool.fit_many` for every point (entries of a `bounds` mapping for fixed parameters
+        are dropped). The fixed parameters are passed to one compiled model as data, so the
+        whole grid needs a single compile. A profile log-likelihood under Gaussian noise of
+        variance s² is −n·loss / (2 s²)."""
+        if self._expr is None:
+            raise ValueError("profile needs a Model made by symbfitrs.compile")
+        fixed = list(fix)
+        unknown = [n for n in fixed if n not in self.params]
+        if unknown or not fixed:
+            raise ValueError(f"fix must name parameters of the model; unknown: {unknown}")
+        free = [n for n in self.params if n not in fixed]
+        if not free:
+            raise ValueError("fix leaves no parameter to fit; use predict to evaluate the model")
+        model = compile(self._expr, [*self.variables, *fixed], free)
+        grids = [np.asarray(fix[n], dtype=np.float64).ravel() for n in fixed]
+        shape = tuple(len(g) for g in grids)
+        cols = [np.asarray(c, dtype=np.float64) for c in _columns(x, self.variables)]
+        m = np.asarray(y).size
+        start = None
+        if p0 is not None:
+            a = np.asarray(p0, dtype=np.float64)
+            start = a[..., [self.params.index(n) for n in free]]
+        if fit_kwargs.get("bounds"):
+            fit_kwargs["bounds"] = {k: v for k, v in fit_kwargs["bounds"].items() if k not in fixed}
+        points = list(np.ndindex(*shape))
+        jobs = []
+        for idx in points:
+            data = cols + [np.full(m, g[i]) for g, i in zip(grids, idx, strict=True)]
+            jobs.append((model, data, y, start, weights))
+        res = Pool(threads).fit_many(
+            jobs,
+            variables=[*self.variables, *fixed],
+            budget_ms=budget_ms,
+            progress=False,
+            **fit_kwargs,
+        )
+        loss = np.full(shape, np.nan)
+        params = np.full((*shape, len(self.params)), np.nan)
+        status = np.empty(shape, dtype=object)
+        for idx, r in zip(points, res, strict=True):
+            status[idx] = r.status
+            if not r.params.size:
+                continue
+            loss[idx] = r.loss
+            for n in free:
+                params[(*idx, self.params.index(n))] = r[n]
+            for n, g, i in zip(fixed, grids, idx, strict=True):
+                params[(*idx, self.params.index(n))] = g[i]
+        return ProfileResult(tuple(fixed), tuple(grids), loss, params, status, tuple(self.params))
 
     def __repr__(self) -> str:
         return f"Model(params={self.params}, variables={self.variables}, linear={self.linear})"
@@ -179,7 +339,8 @@ def compile(  # noqa: A001 (the natural name for the API)
     sqrt, sin, cos, tan, sinh, cosh, tanh, asin, acos, atan, atan2, abs, sign, erf, erfc, max,
     min, pow, wrap (angle to (−π, π]), step (1 for x ≥ 0), expwerfc(a, b) = exp(a)·erfc(b) and
     pi. Raises ValueError on a malformed expression."""
-    return Model(_core.compile(expr, list(variables), None if params is None else list(params)))
+    core = _core.compile(expr, list(variables), None if params is None else list(params))
+    return Model(core, expr)
 
 
 class Pool:
@@ -197,25 +358,43 @@ class Pool:
         progress: bool = True,
         trace: bool = False,
         max_steps: int | None = None,
+        bounds: Bounds | None = None,
     ) -> list[FitResult]:
         """Each job is (model, x, y), (model, x, y, p0) or (model, x, y, p0, weights), where
         model is a compiled Model or an expression over `variables`. Results come back in job
         order; a job that cannot run gets status "error" instead of stopping the batch. Each
         job's budget starts when a thread picks it up. Repeated expressions are compiled once.
-        `trace` and `max_steps` apply to every job, as in `Model.fit`."""
+        A 2-D `p0` gives that job several starts, as in `Model.fit`. `trace`, `max_steps` and
+        `bounds` apply to every job; each job uses the entries of `bounds` that name its model's
+        parameters, so one mapping serves a batch of different expressions. A name in `bounds`
+        that is a parameter of no job's model raises ValueError (it is most likely a typo)."""
         variables = list(variables)
         raw, errors = [], {}
+        params_of: dict[tuple, list[str]] = {}
+        seen: set[str] = set()  # parameter names of the jobs whose model could be read
         for i, (model, x, y, *rest) in enumerate(jobs):
             p0, weights = (*rest, None, None)[:2]
             try:
                 if isinstance(model, Model):
-                    src, names = model._core, model.variables
+                    src, names, params = model._core, model.variables, model.params
                 else:
-                    src, names = model, variables
-                raw.append((src, names, *_args(names, x, y, weights, p0)))
+                    src, names, params = model, variables, None
+                    if bounds:  # bounds are by name, so the expression's parameters are needed here
+                        key = (model, tuple(variables))
+                        if key not in params_of:
+                            params_of[key] = compile(model, variables).params
+                        params = params_of[key]
+                lower, upper = (None, None)
+                if bounds:
+                    seen.update(params)
+                    lower, upper = _bounds(params, bounds, strict=False)
+                _, more = _starts(p0)
+                raw.append((src, names, *_args(names, x, y, weights, p0), more, (lower, upper)))
             except ValueError as e:
                 errors[i] = str(e)
-                raw.append(("", variables, [], b"", None, None))  # placeholder, replaced below
+                raw.append(("", variables, [], b"", None, None, [], (None, None)))  # placeholder
+        if bounds and seen and (unused := [n for n in bounds if n not in seen]):
+            raise ValueError(f"bounds for parameters that no job's model has: {unused}")
         bar = None
         if progress:
             from tqdm.auto import tqdm

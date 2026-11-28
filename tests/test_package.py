@@ -179,3 +179,122 @@ def test_fit_many_trace_matches_fit():
         assert got.status == want.status == "max_steps" and got.steps == 4
         np.testing.assert_array_equal(got.trace, want.trace)
     assert sf.Pool(threads=1).fit_many(jobs, progress=False)[0].trace is None
+
+
+def test_bounds_keep_the_fit_inside_the_box_and_validate_names():
+    x, y = _exp_problem()
+    m = sf.compile("a*exp(-b*x) + c")
+    r = m.fit(x, y, p0=[1, 0.2, 0], bounds={"b": (None, 0.5)}, trace=True)  # the true b is 0.7
+    assert r["b"] == pytest.approx(0.5) and np.all(r.trace[:, m.params.index("b")] <= 0.5 + 1e-12)
+    with pytest.raises(ValueError, match="unknown"):
+        m.fit(x, y, bounds={"nope": (0, 1)})
+    # bounds that never bind change nothing
+    assert (
+        m.fit(x, y, p0=[1, 1, 0], bounds={"b": (-1e6, 1e6)}).steps
+        == m.fit(x, y, p0=[1, 1, 0]).steps
+    )
+
+
+def test_a_bounded_linear_parameter_is_held_at_its_bound():
+    x, y = _exp_problem()
+    m = sf.compile("a*exp(-b*x) + c")
+    r = m.fit(x, -y, bounds={"a": (0, None)})  # the true amplitude is negative: held at its bound
+    assert abs(r["a"]) < 1e-12
+    with pytest.raises(ValueError):
+        m.fit(x, y, bounds={"b": (1.0, 0.0)})
+
+
+def test_fit_many_takes_bounds_by_name():
+    x, y = _exp_problem()
+    expr = "a*exp(-b*x) + c"
+    jobs = [
+        (expr, x, -y),  # an expression: its parameters are found by name for the bounds
+        (sf.compile(expr), x, -y),
+        ("k*x", x, y),  # no parameter "a": fitted without bounds
+    ]
+    r = sf.Pool(threads=2).fit_many(jobs, bounds={"a": (0, None)}, progress=False)
+    assert abs(r[0]["a"]) < 1e-12 and abs(r[1]["a"]) < 1e-12
+    assert r[2].status == "converged"
+    with pytest.raises(ValueError, match="no job"):  # a name that no job has is a typo
+        sf.Pool(threads=1).fit_many(jobs, bounds={"aa": (0, None)}, progress=False)
+
+
+def test_bounds_apply_to_every_start_and_reject_empty_boxes():
+    x, y = _exp_problem()
+    m = sf.compile("a*exp(-b*x) + c")
+    r = m.fit(x, y, p0=[[1, 3, 0], [1, -4, 0], [1, 0.1, 0]], bounds={"b": (0, 0.5)})
+    assert np.all((r.start_params[:, 1] >= 0) & (r.start_params[:, 1] <= 0.5))
+    assert r["b"] == pytest.approx(0.5)
+    with pytest.raises(ValueError):
+        m.fit(x, y, bounds={"b": (np.inf, np.inf)})
+
+
+def test_several_starts_keep_the_best():
+    m = sf.compile("a*sin(c*x)")
+    x = np.arange(200) * 0.05
+    y = 1.5 * np.sin(3.0 * x)
+    one = m.fit(x, y, p0=[1.0, 0.5], budget_ms=200)
+    assert one.loss > 1e-3 and one.start_losses.shape == (1,) and one.start_params.shape == (1, 2)
+    r = m.fit(x, y, p0=[[1.0, 0.5], [1.0, 2.9], [1.0, 9.0]], budget_ms=300)
+    assert r.loss < 1e-20 and r["c"] == pytest.approx(3.0, abs=1e-8)
+    assert r.start_losses.shape == (3,) and r.start_params.shape == (3, 2)
+    assert r.start_losses[1] == r.loss and r.start_losses[0] == one.loss
+    with pytest.raises(ValueError):
+        m.fit(x, y, p0=np.ones((1, 2, 2)))
+
+
+def test_fit_many_takes_several_starts():
+    m = sf.compile("a*sin(c*x)")
+    x = np.arange(200) * 0.05
+    y = 1.5 * np.sin(3.0 * x)
+    jobs = [
+        (m, x, y, [[1.0, 0.5], [1.0, 2.9]]),
+        (m, x, y, [1.0, 0.5]),
+        (m, x, y, np.ones((1, 2, 2))),
+    ]
+    r = sf.Pool(threads=2).fit_many(jobs, budget_ms=300, progress=False)
+    assert r[0].loss < 1e-20 and r[0].start_losses.shape == (2,)
+    assert r[1].start_losses.shape == (1,) and r[1].loss > 1e-3
+    assert r[2].status == "error"
+
+
+def test_profile_minimum_matches_the_free_fit():
+    x, y = _exp_problem()
+    m = sf.compile("a*exp(-b*x) + c")
+    free = m.fit(x, y, p0=[1, 1, 0])
+    grid = np.linspace(free["b"] - 0.2, free["b"] + 0.2, 41)  # contains the free fit's b
+    prof = m.profile(x, y, fix={"b": grid}, p0=[1, 1, 0], budget_ms=50)
+    assert prof.loss.shape == (41,) and prof.params.shape == (41, 3) and prof.fixed == ("b",)
+    k = int(np.nanargmin(prof.loss))
+    assert abs(grid[k] - free["b"]) <= 0.01 + 1e-12
+    assert np.all(prof.loss >= free.loss - 1e-12)  # fixing a parameter cannot beat the free fit
+    np.testing.assert_allclose(prof.params[:, m.params.index("b")], grid)
+    assert prof.best()["b"] == grid[k]
+
+
+def test_profile_two_parameters_and_bad_names():
+    m = sf.compile("a*exp(-b*x) + c*x")
+    x = np.linspace(0, 4, 60)
+    y = 2.0 * np.exp(-0.7 * x) + 0.3 * x
+    prof = m.profile(x, y, fix={"b": [0.5, 0.7, 0.9], "c": [0.1, 0.3]}, p0=[1, 1, 1])
+    assert prof.loss.shape == (3, 2)
+    assert np.unravel_index(np.nanargmin(prof.loss), (3, 2)) == (1, 1)
+    with pytest.raises(ValueError):
+        m.profile(x, y, fix={"nope": [1.0]})
+    with pytest.raises(ValueError):
+        m.profile(x, y, fix={})
+    with pytest.raises(ValueError, match="no parameter to fit"):
+        m.profile(x, y, fix={"a": [1.0], "b": [0.7], "c": [0.3]})
+    with pytest.raises(ValueError, match="finite"):
+        m.profile(x, y, fix={"b": []}).best()
+
+
+def test_profile_takes_bounds_and_several_starts():
+    x, y = _exp_problem()
+    m = sf.compile("a*exp(-b*x) + c")
+    # bounds on the fixed parameter are dropped; those on free ones apply at every grid point
+    prof = m.profile(x, y, fix={"b": [0.6, 0.7]}, bounds={"b": (0, 0.1), "c": (None, 0.2)})
+    assert np.all(prof.params[..., m.params.index("c")] <= 0.2 + 1e-12)
+    # a 2-D p0 gives every grid point several starts (fixed entries ignored)
+    prof = m.profile(x, y, fix={"b": [0.7]}, p0=[[1, 0, 0], [2, 0, 0.3]])
+    assert prof.loss[0] < 1e-20

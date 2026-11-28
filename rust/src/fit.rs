@@ -36,8 +36,20 @@ impl Path {
 
 /// Fit `prob` from `theta0` under `tr`'s deadline. Returns the status and the route taken.
 pub fn fit(prob: &mut Problem, theta0: &[f64], tr: &mut Tracker) -> (Status, Path) {
-    let opts = Opts::default();
-    if !prob.lin.is_empty() && prob.sep.is_some() {
+    fit_with(prob, theta0, tr, &Opts::default())
+}
+
+/// `fit` with solver options. `base.lower`/`upper` are per parameter (length p). Bounds on a
+/// linear parameter turn variable projection off (all parameters are then ordinary variables);
+/// otherwise the bounds of the nonlinear parameters are passed to the projected problem.
+pub fn fit_with(prob: &mut Problem, theta0: &[f64], tr: &mut Tracker, base: &Opts) -> (Status, Path) {
+    let mut opts = base.clone();
+    let finite = |v: &Option<Vec<f64>>, i: usize, inf: f64| v.as_ref().is_some_and(|b| b[i] != inf);
+    let lin_bounded = prob.lin.iter().any(|&i| finite(&base.lower, i, f64::NEG_INFINITY) || finite(&base.upper, i, f64::INFINITY));
+    if !prob.lin.is_empty() && prob.sep.is_some() && !lin_bounded {
+        let pick = |v: &Option<Vec<f64>>| v.as_ref().map(|b| prob.nonlin.iter().map(|&i| b[i]).collect::<Vec<f64>>());
+        opts.lower = pick(&base.lower);
+        opts.upper = pick(&base.upper);
         let mut vp = VarPro::new(prob, tr);
         let beta0 = vp.beta_of(theta0);
         if beta0.is_empty() {

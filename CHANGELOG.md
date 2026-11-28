@@ -5,6 +5,23 @@ not listed here.
 
 ## Unreleased
 
+- `Model.fit` and `Pool.fit_many` take `bounds={name: (lo, hi)}` (`None` = unbounded on that
+  side). An active-set Levenberg–Marquardt step keeps every iterate inside the box: a parameter on
+  a bound is held there while its gradient points out of the box and released when it turns
+  inward, and every start is moved into the box first. In `Pool.fit_many` each job uses the
+  entries that name its own model's parameters, so one mapping serves a batch of different
+  expressions; a name that matches no job raises ValueError. `lo == hi` fixes a parameter.
+  Bounds replace clipping inside the expression, whose clipped region has zero gradient.
+  Bounding a linear parameter turns variable projection off. Without bounds the solver path is unchanged.
+- `p0` may be 2-D (one start per row) in `Model.fit` and `Pool.fit_many` jobs. Each start is
+  fitted in turn with an equal share of the budget left when it begins; the lowest loss is kept,
+  and the status, steps, history and trace are that start's. `FitResult.start_losses` and
+  `FitResult.start_params` report every start, which shows whether the fit has more than one
+  optimum. A 1-D `p0` behaves as before. The data are bound to the model once for all starts.
+- `Model.profile(x, y, fix={name: grid, ...})` fits the model with the named parameters fixed at
+  every point of a grid and returns the best loss and parameters at each point, for profile
+  likelihoods and confidence intervals. One compile covers the whole grid (fixed parameters are
+  passed as data), and the points run on a `Pool`.
 - `Model.fit` and `Pool.fit_many` take `trace=True` and `max_steps=`. With `trace`, `FitResult.trace`
   holds the parameter vector (in `names` order) at step 0 (the start, with eliminated linear
   parameters already solved at it) and after every accepted update, shape `(steps + 1, n_params)`; rejected trials and residual or Jacobian evaluations do
