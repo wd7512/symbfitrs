@@ -46,6 +46,12 @@ class FitResult:
     # the start; linear parameters that the solver eliminates are already solved exactly at it.
     steps: int = 0
     trace: np.ndarray | None = None
+    # with several starts (a 2-D `p0`), every start's final loss and parameters, in start order;
+    # `params`, `loss`, `status`, `steps`, the history and the trace are the best start's. Starts
+    # that end at clearly different losses, or at the same loss with different parameters, show
+    # that the fit has more than one optimum.
+    start_losses: np.ndarray = field(default_factory=lambda: np.array([]))
+    start_params: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
 
     @property
     def success(self) -> bool:
@@ -86,26 +92,44 @@ def _args(variables, x, y, weights, p0):
     m = len(yb) // 8
     xs = [_bytes(c, m, f"x[{v!r}]") for v, c in zip(variables, _columns(x, variables), strict=True)]
     w = None if weights is None else _bytes(weights, m, "weights")
-    return xs, yb, w, None if p0 is None else [float(v) for v in p0]
+    first, _ = _starts(p0)
+    return xs, yb, w, first
+
+
+def _starts(p0):
+    """p0 as (first start, further starts): a 1-D p0 is one start, a 2-D one a start per row."""
+    if p0 is None:
+        return None, []
+    a = np.asarray(p0, dtype=np.float64)
+    if a.ndim == 1:
+        return a.tolist(), []
+    if a.ndim == 2 and len(a) > 0:
+        return a[0].tolist(), a[1:].tolist()
+    raise ValueError("p0 must be 1-D (one start) or 2-D (one start per row)")
 
 
 Bounds = Mapping[str, tuple[float | None, float | None]]
 
 
-def _bounds(params: Sequence[str], bounds: Bounds | None):
-    """{name: (lo, hi)} as (lower, upper) lists in `params` order; None = no bounds."""
+def _bounds(params: Sequence[str], bounds: Bounds | None, strict: bool = True):
+    """{name: (lo, hi)} as (lower, upper) lists in `params` order; (None, None) = no bounds.
+    With `strict`, a name that is not in `params` is an error; otherwise it is skipped."""
     if not bounds:
         return None, None
     unknown = [n for n in bounds if n not in params]
-    if unknown:
+    if unknown and strict:
         raise ValueError(f"bounds for unknown parameters {unknown}")
+    if len(unknown) == len(bounds):
+        return None, None
     lo, hi = [], []
     for n in params:
         a, b = bounds.get(n, (None, None))
         lo.append(-np.inf if a is None else float(a))
         hi.append(np.inf if b is None else float(b))
-        if np.isnan(lo[-1]) or np.isnan(hi[-1]) or lo[-1] > hi[-1]:
-            raise ValueError(f"bounds for {n!r} must have lower <= upper")
+        if not (lo[-1] <= hi[-1] and lo[-1] < np.inf and hi[-1] > -np.inf):  # also catches NaN
+            raise ValueError(
+                f"bounds for {n!r} must have lower <= upper, lower < inf, upper > -inf"
+            )
     return lo, hi
 
 
@@ -122,7 +146,7 @@ def _result(raw) -> FitResult:
         hist_ms,
         hist_loss,
         steps,
-        trace,
+        (trace, start_losses, start_params),
     ) = raw
     return FitResult(
         tuple(names),
@@ -137,6 +161,8 @@ def _result(raw) -> FitResult:
         np.array(hist_loss),
         steps,
         None if trace is None else np.array(trace, dtype=float).reshape(-1, len(names)),
+        np.array(start_losses, dtype=float),
+        np.array(start_params, dtype=float).reshape(-1, len(names)),
     )
 
 
@@ -181,21 +207,29 @@ class Model:
     ) -> FitResult:
         """Minimise Σ (w (f(x; θ) − y))² from `p0` (default: all ones) within `budget_ms`.
 
+        `p0` may be 2-D, one start per row: each start is fitted in turn, with an equal share of
+        the budget that is left when it begins, and the lowest loss is kept (`start_losses` and
+        `start_params` report every start). With many starts and a small budget the last starts
+        may get no time at all: their loss is NaN.
+
         `bounds={name: (lo, hi)}` (None = unbounded on that side) keeps every iterate inside the
         box: a parameter on a bound is held there while its gradient points out of the box, and
-        the start is first moved into the box. Use it instead of clipping inside the expression,
-        where the clipped region has zero gradient and a parameter that lands there cannot come
-        back. `lo == hi` fixes a parameter. Bounding a linear parameter turns variable projection
-        off.
+        every start is first moved into the box. Use it instead of clipping inside the
+        expression, where the clipped region has zero gradient and a parameter that lands there
+        cannot come back. `lo == hi` fixes a parameter. Bounding a linear parameter turns
+        variable projection off.
 
         `trace=True` also returns θ at step 0 (the start) and after every accepted update;
-        `max_steps` stops after that many accepted updates (status "max_steps")."""
+        `max_steps` stops after that many accepted updates (status "max_steps"). With several
+        starts, the status, steps and trace are the best start's."""
+        _, more = _starts(p0)
         lower, upper = _bounds(self.params, bounds)
         raw = self._core.fit(
             *_args(self.variables, x, y, weights, p0),
             float(budget_ms),
             trace,
             max_steps,
+            more,
             lower,
             upper,
         )
@@ -237,11 +271,14 @@ class Pool:
         model is a compiled Model or an expression over `variables`. Results come back in job
         order; a job that cannot run gets status "error" instead of stopping the batch. Each
         job's budget starts when a thread picks it up. Repeated expressions are compiled once.
-        `trace`, `max_steps` and `bounds` apply to every job, as in `Model.fit`; a job whose model
-        has no parameter named in `bounds` is an error."""
+        A 2-D `p0` gives that job several starts, as in `Model.fit`. `trace`, `max_steps` and
+        `bounds` apply to every job; each job uses the entries of `bounds` that name its model's
+        parameters, so one mapping serves a batch of different expressions. A name in `bounds`
+        that is a parameter of no job's model raises ValueError (it is most likely a typo)."""
         variables = list(variables)
         raw, errors = [], {}
         params_of: dict[tuple, list[str]] = {}
+        seen: set[str] = set()  # parameter names of the jobs whose model could be read
         for i, (model, x, y, *rest) in enumerate(jobs):
             p0, weights = (*rest, None, None)[:2]
             try:
@@ -254,11 +291,17 @@ class Pool:
                         if key not in params_of:
                             params_of[key] = compile(model, variables).params
                         params = params_of[key]
-                lower, upper = _bounds(params, bounds) if bounds else (None, None)
-                raw.append((src, names, *_args(names, x, y, weights, p0), (lower, upper)))
+                lower, upper = (None, None)
+                if bounds:
+                    seen.update(params)
+                    lower, upper = _bounds(params, bounds, strict=False)
+                _, more = _starts(p0)
+                raw.append((src, names, *_args(names, x, y, weights, p0), more, (lower, upper)))
             except ValueError as e:
                 errors[i] = str(e)
-                raw.append(("", variables, [], b"", None, None, (None, None)))  # placeholder
+                raw.append(("", variables, [], b"", None, None, [], (None, None)))  # placeholder
+        if bounds and seen and (unused := [n for n in bounds if n not in seen]):
+            raise ValueError(f"bounds for parameters that no job's model has: {unused}")
         bar = None
         if progress:
             from tqdm.auto import tqdm

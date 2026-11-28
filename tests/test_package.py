@@ -210,8 +210,49 @@ def test_fit_many_takes_bounds_by_name():
     jobs = [
         (expr, x, -y),  # an expression: its parameters are found by name for the bounds
         (sf.compile(expr), x, -y),
-        ("k*x", x, y),  # no parameter "a": an error for this job only
+        ("k*x", x, y),  # no parameter "a": fitted without bounds
     ]
     r = sf.Pool(threads=2).fit_many(jobs, bounds={"a": (0, None)}, progress=False)
     assert abs(r[0]["a"]) < 1e-12 and abs(r[1]["a"]) < 1e-12
-    assert r[2].status == "error" and "unknown parameters" in r[2].message
+    assert r[2].status == "converged"
+    with pytest.raises(ValueError, match="no job"):  # a name that no job has is a typo
+        sf.Pool(threads=1).fit_many(jobs, bounds={"aa": (0, None)}, progress=False)
+
+
+def test_bounds_apply_to_every_start_and_reject_empty_boxes():
+    x, y = _exp_problem()
+    m = sf.compile("a*exp(-b*x) + c")
+    r = m.fit(x, y, p0=[[1, 3, 0], [1, -4, 0], [1, 0.1, 0]], bounds={"b": (0, 0.5)})
+    assert np.all((r.start_params[:, 1] >= 0) & (r.start_params[:, 1] <= 0.5))
+    assert r["b"] == pytest.approx(0.5)
+    with pytest.raises(ValueError):
+        m.fit(x, y, bounds={"b": (np.inf, np.inf)})
+
+
+def test_several_starts_keep_the_best():
+    m = sf.compile("a*sin(c*x)")
+    x = np.arange(200) * 0.05
+    y = 1.5 * np.sin(3.0 * x)
+    one = m.fit(x, y, p0=[1.0, 0.5], budget_ms=200)
+    assert one.loss > 1e-3 and one.start_losses.shape == (1,) and one.start_params.shape == (1, 2)
+    r = m.fit(x, y, p0=[[1.0, 0.5], [1.0, 2.9], [1.0, 9.0]], budget_ms=300)
+    assert r.loss < 1e-20 and r["c"] == pytest.approx(3.0, abs=1e-8)
+    assert r.start_losses.shape == (3,) and r.start_params.shape == (3, 2)
+    assert r.start_losses[1] == r.loss and r.start_losses[0] == one.loss
+    with pytest.raises(ValueError):
+        m.fit(x, y, p0=np.ones((1, 2, 2)))
+
+
+def test_fit_many_takes_several_starts():
+    m = sf.compile("a*sin(c*x)")
+    x = np.arange(200) * 0.05
+    y = 1.5 * np.sin(3.0 * x)
+    jobs = [
+        (m, x, y, [[1.0, 0.5], [1.0, 2.9]]),
+        (m, x, y, [1.0, 0.5]),
+        (m, x, y, np.ones((1, 2, 2))),
+    ]
+    r = sf.Pool(threads=2).fit_many(jobs, budget_ms=300, progress=False)
+    assert r[0].loss < 1e-20 and r[0].start_losses.shape == (2,)
+    assert r[1].start_losses.shape == (1,) and r[1].loss > 1e-3
+    assert r[2].status == "error"
