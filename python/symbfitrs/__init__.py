@@ -17,7 +17,7 @@ import numpy as np
 
 from . import _core
 
-__all__ = ["FitResult", "Model", "Pool", "compile"]
+__all__ = ["FitResult", "Model", "Pool", "ProfileResult", "compile"]
 __version__ = version("symbfitrs")
 
 
@@ -62,6 +62,30 @@ class FitResult:
 
     def as_dict(self) -> dict[str, float]:
         return dict(zip(self.names, self.params.tolist(), strict=True))
+
+
+@dataclass(frozen=True)
+class ProfileResult:
+    """`Model.profile` output: the best fit at every point of the grid of fixed parameters.
+
+    `loss` has one axis per fixed parameter (`fixed` order, values in `grids`); `params` adds a
+    last axis with every parameter in `names` order, the fixed ones included; `status` is each
+    point's fit status. A point whose fit could not run has NaN loss and parameters."""
+
+    fixed: tuple[str, ...]
+    grids: tuple[np.ndarray, ...]
+    loss: np.ndarray
+    params: np.ndarray
+    status: np.ndarray
+    names: tuple[str, ...]
+
+    def best(self) -> dict[str, float]:
+        """The grid point with the lowest loss, as {name: value} for every parameter. Raises
+        ValueError when no point has a finite loss."""
+        if not np.isfinite(self.loss).any():
+            raise ValueError("no grid point has a finite loss")
+        i = np.unravel_index(np.nanargmin(self.loss), self.loss.shape)
+        return dict(zip(self.names, self.params[i].tolist(), strict=True))
 
 
 def _bytes(a, n: int | None, what: str) -> bytes:
@@ -170,8 +194,9 @@ class Model:
     """A compiled expression: parsed, differentiated and split into linear and nonlinear
     parameters once, then fitted any number of times."""
 
-    def __init__(self, core: _core.Model) -> None:
+    def __init__(self, core: _core.Model, expr: str | None = None) -> None:
         self._core = core
+        self._expr = expr  # kept so that `profile` can recompile with parameters fixed
 
     @property
     def params(self) -> list[str]:
@@ -235,6 +260,73 @@ class Model:
         )
         return _result(raw)
 
+    def profile(
+        self,
+        x,
+        y,
+        fix: Mapping[str, Sequence[float]],
+        *,
+        p0=None,
+        weights=None,
+        budget_ms: float = 5.0,
+        threads: int | None = None,
+        **fit_kwargs,
+    ) -> ProfileResult:
+        """Fit with the parameters named in `fix` held at every point of their grid.
+
+        `fix` maps each fixed parameter to its grid values; the grid is their outer product, in
+        the order given. Every point is fitted from `p0` (in `params` order; the fixed entries
+        are ignored) within `budget_ms`, on a `Pool` of `threads`. Further keyword arguments go
+        to `Pool.fit_many` for every point (entries of a `bounds` mapping for fixed parameters
+        are dropped). The fixed parameters are passed to one compiled model as data, so the
+        whole grid needs a single compile. A profile log-likelihood under Gaussian noise of
+        variance s² is −n·loss / (2 s²)."""
+        if self._expr is None:
+            raise ValueError("profile needs a Model made by symbfitrs.compile")
+        fixed = list(fix)
+        unknown = [n for n in fixed if n not in self.params]
+        if unknown or not fixed:
+            raise ValueError(f"fix must name parameters of the model; unknown: {unknown}")
+        free = [n for n in self.params if n not in fixed]
+        if not free:
+            raise ValueError("fix leaves no parameter to fit; use predict to evaluate the model")
+        model = compile(self._expr, [*self.variables, *fixed], free)
+        grids = [np.asarray(fix[n], dtype=np.float64).ravel() for n in fixed]
+        shape = tuple(len(g) for g in grids)
+        cols = [np.asarray(c, dtype=np.float64) for c in _columns(x, self.variables)]
+        m = np.asarray(y).size
+        start = None
+        if p0 is not None:
+            a = np.asarray(p0, dtype=np.float64)
+            start = a[..., [self.params.index(n) for n in free]]
+        if fit_kwargs.get("bounds"):
+            fit_kwargs["bounds"] = {k: v for k, v in fit_kwargs["bounds"].items() if k not in fixed}
+        points = list(np.ndindex(*shape))
+        jobs = []
+        for idx in points:
+            data = cols + [np.full(m, g[i]) for g, i in zip(grids, idx, strict=True)]
+            jobs.append((model, data, y, start, weights))
+        res = Pool(threads).fit_many(
+            jobs,
+            variables=[*self.variables, *fixed],
+            budget_ms=budget_ms,
+            progress=False,
+            **fit_kwargs,
+        )
+        loss = np.full(shape, np.nan)
+        params = np.full((*shape, len(self.params)), np.nan)
+        status = np.empty(shape, dtype=object)
+        for idx, r in zip(points, res, strict=True):
+            status[idx] = r.status
+            if not r.params.size:
+                continue
+            loss[idx] = r.loss
+            for n in free:
+                params[(*idx, self.params.index(n))] = r[n]
+            for n, g, i in zip(fixed, grids, idx, strict=True):
+                params[(*idx, self.params.index(n))] = g[i]
+        return ProfileResult(tuple(fixed), tuple(grids), loss, params, status, tuple(self.params))
+
     def __repr__(self) -> str:
         return f"Model(params={self.params}, variables={self.variables}, linear={self.linear})"
 
@@ -247,7 +339,8 @@ def compile(  # noqa: A001 (the natural name for the API)
     sqrt, sin, cos, tan, sinh, cosh, tanh, asin, acos, atan, atan2, abs, sign, erf, erfc, max,
     min, pow, wrap (angle to (−π, π]), step (1 for x ≥ 0), expwerfc(a, b) = exp(a)·erfc(b) and
     pi. Raises ValueError on a malformed expression."""
-    return Model(_core.compile(expr, list(variables), None if params is None else list(params)))
+    core = _core.compile(expr, list(variables), None if params is None else list(params))
+    return Model(core, expr)
 
 
 class Pool:

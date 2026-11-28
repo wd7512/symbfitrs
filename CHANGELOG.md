@@ -18,6 +18,10 @@ not listed here.
   and the status, steps, history and trace are that start's. `FitResult.start_losses` and
   `FitResult.start_params` report every start, which shows whether the fit has more than one
   optimum. A 1-D `p0` behaves as before. The data are bound to the model once for all starts.
+- `Model.profile(x, y, fix={name: grid, ...})` fits the model with the named parameters fixed at
+  every point of a grid and returns the best loss and parameters at each point, for profile
+  likelihoods and confidence intervals. One compile covers the whole grid (fixed parameters are
+  passed as data), and the points run on a `Pool`.
 - `Model.fit` and `Pool.fit_many` take `trace=True` and `max_steps=`. With `trace`, `FitResult.trace`
   holds the parameter vector (in `names` order) at step 0 (the start, with eliminated linear
   parameters already solved at it) and after every accepted update, shape `(steps + 1, n_params)`; rejected trials and residual or Jacobian evaluations do
